@@ -1,17 +1,10 @@
 /*
  * Smart Adaptive Street Lighting System - Controller Firmware
  * Platform: Cytron Maker Feather AIoT S3 (ESP32-S3)
- * Language: C++
- * 
- * Features:
- * - MQTT Communication (JSON payload)
- * - Sliding Window Filter (Noise Reduction)
- * - Hysteresis (State Stability)
- * - Dynamic Self-Calibration
- * - Anomaly Detection
- * - NeoPixel Status LED
+ * Language: C++ (PlatformIO)
  */
 
+#include <Arduino.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>

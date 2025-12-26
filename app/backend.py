@@ -139,6 +139,7 @@ def manual_data():
     """Manual data injection for testing without hardware"""
     try:
         data = request.json
+        print(f"📡 INCOMING DATA: {data}") # DEBUG LOG
         if not data:
             return jsonify({"error": "No JSON data provided"}), 400
 
