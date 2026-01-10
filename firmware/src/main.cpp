@@ -1,111 +1,288 @@
 /*
- * Smart Street Light - Direct Database Version (No GCP)
- * Platform: Cytron Maker Feather AIoT S3 (ESP32-S3)
- * Communication: HTTP POST -> Python Backend -> MongoDB
+ * Smart Street Light - NON-BLOCKING VERSION
+ * Platform: Cytron Maker Feather AIoT S3
+ * 
+ * Logic:
+ * - LDR: Reads every 100ms (Smoothed).
+ * - PIR: Retriggerable 30s timer.
+ * - PWM: 100% Brightness on Motion, 30% on Standby (Night only).
+ * - Connectivity: WiFi, MQTT (GCP), HTTP (Local).
+ * - NETWORK FIX: Reconnects only every 5s to prevent freezing existing logic.
  */
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <PubSubClient.h>
 #include <ArduinoJson.h>
 
-// === CONFIGURATION ===
+// === WI-FI CONFIGURATION ===
 const char* ssid = "Galaxy Note10 Lite2a71";
 const char* password = "noob1234"; 
 
-// REPLACE WITH YOUR LAPTOP'S IP ADDRESS (Run 'ipconfig' on Windows)
-// e.g., "http://192.168.1.10:5000/data"
-const char* serverUrl = "http://10.13.13.145:5000/data"; 
+// === LOCAL HTTP CONFIGURATION ===
+const char* serverUrl = "http://10.174.2.145:5000/data"; 
+
+// === MQTT CONFIGURATION (GCP VM) ===
+const char* mqtt_server = "34.171.38.56";
+const int mqtt_port = 1883;
+const char* mqtt_topic = "smartcity/streetlight/1/data";
+const char* device_id = "streetlight-001";
 
 // === PIN CONFIGURATION ===
-// Matching user's working Arduino code EXACTLY:
-const int PIR_PIN = A3;  // Same as Arduino: pirPin = A3
-const int LDR_PIN = 4;   // Same as Arduino: lightPin = 4
-const int LED_PIN = 46;  // Built-in LED
+const int PIR_PIN = A2;     
+const int MOSFET_PIN = 14; 
+const int LDR_PIN = 4;      
+const int LED_PIN = 46;     
+
+// === PWM CONFIGURATION ===
+const int PWM_CHANNEL = 0;
+const int PWM_FREQ = 5000;    
+const int PWM_RESOLUTION = 8; 
+
+// === TIMING CONSTANTS ===
+const unsigned long LIGHT_TIMER_MS = 30000;   // 30 seconds light duration
+const unsigned long REPORT_INTERVAL_MS = 5000;
+const unsigned long RECONNECT_INTERVAL_MS = 5000; // Try reconnecting every 5s
+const float MAX_LED_POWER_W = 20.0; // Maximum power consumption of LED strip at 100%
+
+// === STATE VARIABLES ===
+unsigned long lastMotionSeenTime = 0;  
+unsigned long lastReportTime = 0;
+unsigned long lastLdrTime = 0;
+unsigned long lastReconnectAttempt = 0; // For non-blocking MQTT
+
+bool isNightMode = false;
+volatile bool motionDetectedFlag = false; // Volatile for ISR 
+
+// Sliding Window for LDR
+const int WINDOW_SIZE = 10;
+int ldrReadings[WINDOW_SIZE];
+int ldrIndex = 0;
+long ldrSum = 0;
+
+// State tracking for event-driven reporting
+bool lastSentMotionState = false;
+bool lastSentNightMode = false;
+
+// Forward declaration for helper function
+void sendTelemetry(bool isNightMode, bool isMotionActive, int pwmValue, int ldrValue, long countdownSec);
+
+// === PIR Interrupt Handler ===
+void IRAM_ATTR onMotionDetected() {
+    motionDetectedFlag = true;
+}
+
+// === Clients ===
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+void reconnectMQTT() {
+  if (mqttClient.connected()) return; // Already connected
+
+  unsigned long now = millis();
+  if (now - lastReconnectAttempt > RECONNECT_INTERVAL_MS) {
+    lastReconnectAttempt = now;
+    
+    Serial.print("Attempting MQTT connection... ");
+    // Attempt to connect
+    if (mqttClient.connect(device_id)) {
+      Serial.println("connected");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.println(mqttClient.state());
+      Serial.println(" (retrying in 5 seconds)");
+    }
+  }
+}
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  delay(1000); 
 
-  Serial.println("\n--- Smart Street Light (Direct HTTP Mode) ---");
+  Serial.println("\n--- Smart Street Light (Non-Blocking) ---");
 
-  // Initialize Pins
-  pinMode(PIR_PIN, INPUT);
-  pinMode(LDR_PIN, INPUT);
+  pinMode(PIR_PIN, INPUT_PULLDOWN); 
+  pinMode(LDR_PIN, INPUT); 
   pinMode(LED_PIN, OUTPUT);
+  
+  // === PIR INTERRUPT SETUP ===
+  attachInterrupt(digitalPinToInterrupt(PIR_PIN), onMotionDetected, RISING);
+  
+  // === PWM SETUP ===
+  #ifdef ESP_ARDUINO_VERSION_MAJOR
+    #if ESP_ARDUINO_VERSION_MAJOR >= 3
+      ledcAttach(MOSFET_PIN, PWM_FREQ, PWM_RESOLUTION);
+    #else
+      ledcSetup(PWM_CHANNEL, PWM_FREQ, PWM_RESOLUTION);
+      ledcAttachPin(MOSFET_PIN, PWM_CHANNEL);
+    #endif
+  #else
+    ledcSetup(PWM_CHANNEL, PWM_FREQ, PWM_RESOLUTION);
+    ledcAttachPin(MOSFET_PIN, PWM_CHANNEL);
+  #endif
+  
+  // Initialize LDR buffer
+  for(int i=0; i<WINDOW_SIZE; i++) ldrReadings[i] = 0;
 
-  // Connect to WiFi
+  // === WiFi Setup ===
   Serial.print("Connecting to WiFi: ");
-  Serial.println(ssid);
   WiFi.begin(ssid, password);
-
-  while (WiFi.status() != WL_CONNECTED) {
+  // Initial blocking wait for WiFi is okay in setup, but if it fails we continue
+  int wifi_timeout = 20; 
+  while (WiFi.status() != WL_CONNECTED && wifi_timeout > 0) {
     delay(500);
     Serial.print(".");
-    digitalWrite(LED_PIN, !digitalRead(LED_PIN)); // Blink while connecting
+    wifi_timeout--;
   }
   
-  Serial.println("\nWiFi Connected!");
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
-  digitalWrite(LED_PIN, LOW); // LED ON (Active Low usually) indicates connected
+  if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\nWiFi Connected!");
+  } else {
+      Serial.println("\nWiFi Not Connected (will try in background)");
+  }
+
+  // === MQTT Setup ===
+  mqttClient.setServer(mqtt_server, mqtt_port);
 }
 
 void loop() {
-  // 1. Read Sensors
-  int motionState = digitalRead(PIR_PIN);
-  int lightValue = analogRead(LDR_PIN);
+  unsigned long now = millis();
 
-  // DEBUG: Print raw sensor values
-  Serial.print("RAW -> Motion: ");
-  Serial.print(motionState);
-  Serial.print(" | Light: ");
-  Serial.println(lightValue);
-
-  // 2. Prepare Data JSON
-  StaticJsonDocument<200> doc;
-  doc["ldr"] = lightValue;
-  doc["motion"] = motionState;
-  
-  // Simulated Power Calculation based on logic
-  // If it's dark (high value?) and motion detected -> High Power
-  // Adjust logic based on your sensor (0=Dark or 4095=Dark?)
-  // Assuming 0=Dark for now based on typical LDR pull-up, but user said "0 = Dark"
-  int brightness = 0;
-  if (lightValue < 2000) { // Night time
-      if (motionState == HIGH) brightness = 100;
-      else brightness = 30;
-  }
-  doc["brightness"] = brightness;
-  doc["power"] = (brightness * 10.0) / 100.0; 
-
-  String jsonPayload;
-  serializeJson(doc, jsonPayload);
-
-  // 3. Send via HTTP POST
+  // === NETWORKING ===
+  // Only handle network if WiFi is connected, otherwise ESP usually auto-reconnects in background
   if (WiFi.status() == WL_CONNECTED) {
-    HTTPClient http;
-    http.begin(serverUrl);
-    http.addHeader("Content-Type", "application/json");
-
-    Serial.print("Sending Data: ");
-    Serial.println(jsonPayload);
-
-    int httpResponseCode = http.POST(jsonPayload);
-
-    if (httpResponseCode > 0) {
-      String response = http.getString();
-      Serial.print("Server Response: ");
-      Serial.println(httpResponseCode); // Should be 201
-    } else {
-      Serial.print("Error on sending POST: ");
-      Serial.println(httpResponseCode);
-    }
-    http.end();
-  } else {
-    Serial.println("WiFi Disconnected");
+      reconnectMQTT(); // Non-blocking check
+      if (mqttClient.connected()) {
+          mqttClient.loop();
+      }
   }
 
-  // 4. Wait before next reading
-  delay(2000); 
+  // === 1. LDR READING ===
+  // Option A: Simple instant logic (currently active)
+  // Digital output: 1=dark (night), 0=bright (day)
+  static int smoothedLdr = 0;
+  
+  int rawLdr = digitalRead(LDR_PIN);
+  smoothedLdr = rawLdr; // Store for telemetry
+  isNightMode = (rawLdr == 1); // Instant reaction: 1=night, 0=day
+  
+  // --- Option B: HYSTERESIS (Commented - uncomment to use instead of Option A) ---
+  // Prevents flickering at sunrise/sunset by requiring multiple consistent readings
+  /*
+  static int smoothedLdr = 0;
+  if (now - lastLdrTime > 100) {
+      lastLdrTime = now;
+      
+      int rawLdr = digitalRead(LDR_PIN);
+      
+      ldrSum -= ldrReadings[ldrIndex];
+      ldrReadings[ldrIndex] = rawLdr;
+      ldrSum += rawLdr;
+      ldrIndex = (ldrIndex + 1) % WINDOW_SIZE;
+      
+      smoothedLdr = ldrSum; // Sum of 10 readings (0-10)
+      
+      // Hysteresis thresholds: Night when >7/10 dark, Day when <3/10 dark
+      if (smoothedLdr > (WINDOW_SIZE / 2 + 2)) {
+          isNightMode = true;
+      } else if (smoothedLdr < (WINDOW_SIZE / 2 - 2)) {
+          isNightMode = false;
+      }
+      // Between 3-7: maintain previous state (no change)
+  }
+  */
+
+  // === 2. MOTION LOGIC (Interrupt + Retriggerable Timer) ===
+  // Check interrupt flag (set by ISR)
+  if (motionDetectedFlag) {
+      motionDetectedFlag = false; // Clear flag
+      lastMotionSeenTime = now;
+  }
+  
+  bool isMotionActive = isNightMode && (now - lastMotionSeenTime < LIGHT_TIMER_MS);
+
+  // === 3. CONTROL LOGIC ===
+  // YES, this is affected by ANY delay in the loop. 
+  // By making reconnectMQTT non-blocking, we ensure this runs thousands of times per second.
+  int pwmValue = 0;
+
+  if (isNightMode) {
+      if (isMotionActive) {
+         pwmValue = 255; 
+         digitalWrite(LED_PIN, HIGH);
+      } else {
+         pwmValue = 77; 
+         digitalWrite(LED_PIN, LOW);
+      }
+  } else {
+      pwmValue = 0;     
+      digitalWrite(LED_PIN, LOW);
+  }
+  
+  #ifdef ESP_ARDUINO_VERSION_MAJOR
+    #if ESP_ARDUINO_VERSION_MAJOR >= 3
+      ledcWrite(MOSFET_PIN, pwmValue);
+    #else
+      ledcWrite(PWM_CHANNEL, pwmValue);
+    #endif
+  #else
+     ledcWrite(PWM_CHANNEL, pwmValue);
+  #endif
+
+  // === 4. EVENT-DRIVEN REPORTING (Runs every loop!) ===
+  // Calculate countdown (only valid when motion is active)
+  long countdown = isMotionActive ? (LIGHT_TIMER_MS - (now - lastMotionSeenTime)) / 1000 : 0;
+  
+  bool stateChanged = (isMotionActive != lastSentMotionState) || (isNightMode != lastSentNightMode);
+  if (stateChanged) {
+      Serial.println(">>> STATE CHANGE DETECTED! Sending immediately...");
+      sendTelemetry(isNightMode, isMotionActive, pwmValue, smoothedLdr, countdown);
+      lastSentMotionState = isMotionActive;
+      lastSentNightMode = isNightMode;
+      lastReportTime = now; // Reset heartbeat timer
+  }
+
+  // === 5. PERIODIC HEARTBEAT (Every 2s) ===
+  if (now - lastReportTime > REPORT_INTERVAL_MS) {
+    lastReportTime = now;
+    sendTelemetry(isNightMode, isMotionActive, pwmValue, smoothedLdr, countdown);
+    lastSentMotionState = isMotionActive;
+    lastSentNightMode = isNightMode;
+  }
+}
+
+// === HELPER: Send telemetry data ===
+void sendTelemetry(bool isNight, bool isMotion, int pwm, int ldrValue, long countdownSec) {
+    // Calculate actual power from PWM duty cycle
+    float power = (pwm / 255.0) * MAX_LED_POWER_W;
+    
+    // Serial Reporting
+    Serial.print("M: "); Serial.print(isNight ? "NIGHT" : "DAY");
+    Serial.print(" | Motion: "); Serial.print(isMotion ? "ACTIVE" : "idle");
+    Serial.print(" | LDR: "); Serial.print(ldrValue);
+    Serial.print(" | PWM: "); Serial.print(pwm);
+    Serial.print(" | Power: "); Serial.print(power, 1); Serial.print("W");
+    
+    // Show countdown if motion is active
+    if (isMotion && countdownSec > 0) {
+        Serial.print(" | Off in: "); Serial.print(countdownSec); Serial.println("s");
+    } else {
+        Serial.println("");
+    }
+    
+    // Prepare JSON
+    StaticJsonDocument<200> doc;
+    doc["ldr"] = ldrValue; 
+    doc["motion"] = isMotion ? 1 : 0;
+    doc["brightness"] = (pwm * 100) / 255;
+    doc["power"] = power; 
+
+    String jsonPayload;
+    serializeJson(doc, jsonPayload);
+
+    // Send to MQTT only (HTTP removed to prevent blocking lag)
+    if (mqttClient.connected()) {
+      mqttClient.publish(mqtt_topic, jsonPayload.c_str());
+    }
 }
