@@ -24,3 +24,6 @@ __pycache__/
 *.o
 *.a
 .pio/
+
+# GCP
+gcp/
