@@ -28,4 +28,5 @@ __pycache__/
 # GCP
 gcp/
 
-.pdf
+# Documentation
+*.pdf
