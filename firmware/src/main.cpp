@@ -15,16 +15,19 @@
 #include <HTTPClient.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include "secrets.h"
 
 // === WI-FI CONFIGURATION ===
-const char* ssid = "Galaxy Note10 Lite2a71";
-const char* password = "noob1234"; 
+const char* ssid = WIFI_SSID;
+const char* password = WIFI_PASSWORD; 
+
 
 // === LOCAL HTTP CONFIGURATION ===
 const char* serverUrl = "http://10.174.2.145:5000/data"; 
 
 // === MQTT CONFIGURATION (GCP VM) ===
-const char* mqtt_server = "34.171.38.56";
+const char* mqtt_server = MQTT_SERVER_IP;
+
 const int mqtt_port = 1883;
 const char* mqtt_topic = "smartcity/streetlight/1/data";
 const char* device_id = "streetlight-001";

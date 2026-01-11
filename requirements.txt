@@ -1,0 +1,8 @@
+flask
+flask-cors
+pymongo
+python-dotenv
+flask-socketio
+gevent
+gevent-websocket
+paho-mqtt
