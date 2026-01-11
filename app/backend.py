@@ -2,8 +2,6 @@ import os
 import json
 import datetime
 import threading
-import subprocess
-import platform
 import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -26,6 +24,84 @@ MQTT_TOPIC = os.getenv("MQTT_TOPIC", "smartcity/streetlight/+/data")
 TRADITIONAL_LIGHT_POWER_W = 100.0
 MAX_SMART_LIGHT_POWER_W = 20.0
 
+# --- PROCESSING CONSTANTS (From C++) ---
+WINDOW_SIZE = 10
+MOTION_HISTORY_SIZE = 60  # 2-3 mins of history
+
+# --- IN-MEMORY STATE (Replaces C++ State Files) ---
+device_states = {}
+state_lock = threading.Lock()
+
+def get_device_state(device_id):
+    """Get or initialize state for a device."""
+    with state_lock:
+        if device_id not in device_states:
+            device_states[device_id] = {
+                'ldr_readings': [0] * WINDOW_SIZE,
+                'ldr_index': 0,
+                'ldr_sum': 0,
+                'is_night': False,
+                'motion_history': [0] * MOTION_HISTORY_SIZE,
+                'motion_index': 0,
+                'motion_sum': 0
+            }
+        return device_states[device_id]
+
+def process_sensor_data(device_id, raw_ldr, motion, power):
+    """
+    Python implementation of the C++ processing logic.
+    Sliding window smoothing, hysteresis, traffic analytics.
+    """
+    state = get_device_state(device_id)
+    
+    with state_lock:
+        # 1. Sliding Window (LDR) - for smoothing digital readings
+        state['ldr_sum'] -= state['ldr_readings'][state['ldr_index']]
+        state['ldr_readings'][state['ldr_index']] = raw_ldr
+        state['ldr_sum'] += raw_ldr
+        state['ldr_index'] = (state['ldr_index'] + 1) % WINDOW_SIZE
+        smooth_ldr = state['ldr_sum']  # Sum of 10 readings (0-10 for digital sensor)
+        
+        # 2. Night Detection for DIGITAL LDR (0=day, 1=night)
+        # If more than half the readings are "night" (1), consider it night
+        if smooth_ldr > (WINDOW_SIZE // 2):
+            state['is_night'] = True
+        elif smooth_ldr < (WINDOW_SIZE // 2):
+            state['is_night'] = False
+        # If exactly half, maintain previous state (hysteresis)
+        
+        is_night = state['is_night']
+        
+        # 3. Traffic Analytics (Motion Intensity)
+        state['motion_sum'] -= state['motion_history'][state['motion_index']]
+        state['motion_history'][state['motion_index']] = motion
+        state['motion_sum'] += motion
+        state['motion_index'] = (state['motion_index'] + 1) % MOTION_HISTORY_SIZE
+        
+        traffic_intensity = (state['motion_sum'] / MOTION_HISTORY_SIZE) * 100.0
+        
+        # 4. Logic (Target Brightness)
+        target_brightness = 0
+        if is_night:
+            target_brightness = 100 if motion > 0 else 30
+        
+        # 5. Anomaly Detection
+        anomaly = 0
+        # If target is High but Power is Low -> Blown Bulb
+        if target_brightness > 10 and power < 0.1:
+            anomaly = 1
+        # If target is Off but Power is High -> Leakage
+        if target_brightness == 0 and power > 1.0:
+            anomaly = 2
+    
+    return {
+        'smooth_ldr': smooth_ldr,
+        'is_night': is_night,
+        'brightness': target_brightness,
+        'traffic_intensity': round(traffic_intensity, 1),
+        'anomaly': anomaly
+    }
+
 # --- SETUP APP ---
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret!'
@@ -41,49 +117,31 @@ try:
 except Exception as e:
     print(f"❌ MongoDB Connection Failed: {e}")
 
-# --- LOCK FOR C++ EXECUTABLE (Concurrency Fix) ---
-cpp_lock = threading.Lock()
-
-# --- CORE LOGIC (Unified) ---
+# --- CORE LOGIC (Unified, Python-Only) ---
 def process_data(device_id, raw_ldr, motion, power, source):
     """
     Unified logic channel. Used by both HTTP (Manual) and MQTT (Live).
     1. Caller invokes this function.
-    2. Data is passed to C++ Executable (Safe Lock).
+    2. Data is processed in Python (no C++ dependency).
     3. Result is saved to DB.
     4. Result is emitted to WebSockets.
     """
     try:
-        # Determine executable path based on OS
-        binary_name = "processing.exe" if platform.system() == "Windows" else "./processing"
-        exe_path = os.path.join(os.path.dirname(__file__), binary_name)
+        # 1. PROCESS VIA PYTHON
+        processed = process_sensor_data(device_id, raw_ldr, motion, power)
         
-        # 1. PROCESS VIA C++
-        # Usage: ./processing process <device_id> <ldr> <motion> <power>
-        with cpp_lock:
-            result = subprocess.run(
-                [exe_path, "process", str(device_id), str(raw_ldr), str(motion), str(power)],
-                capture_output=True,
-                text=True,
-                check=True
-            )
-        
-        # Parse Output
-        # Expected: {"smooth_ldr": ..., "is_night": ..., "brightness": ..., "traffic_intensity": ..., "anomaly": ...}
-        processed = json.loads(result.stdout)
-        
-        # 2. PREPARE DB DOCUMENT
+        # 2. PREPARE DB DOCUMENT (field names match frontend expectations)
         document = {
             "timestamp": datetime.datetime.utcnow(),
             "device_id": device_id,
-            "ldr_raw": raw_ldr,
-            "ldr_smooth": processed.get('smooth_ldr', raw_ldr),
+            "ldr": raw_ldr,  # Frontend expects 'ldr'
+            "smooth_ldr": processed['smooth_ldr'],  # Frontend expects 'smooth_ldr'
             "motion": motion,
-            "brightness": processed.get('brightness', 0),
+            "brightness": processed['brightness'],
             "power": power,
-            "is_night": bool(processed.get('is_night', 0)),
-            "traffic_intensity": round(processed.get('traffic_intensity', 0.0), 1), # From C++ now!
-            "anomaly": processed.get('anomaly', 0),
+            "is_night": processed['is_night'],
+            "traffic_intensity": processed['traffic_intensity'],
+            "anomaly": processed['anomaly'],
             "source": source
         }
         
@@ -92,21 +150,20 @@ def process_data(device_id, raw_ldr, motion, power, source):
         # Convert ObjectId
         doc_json = document.copy()
         doc_json['_id'] = str(doc_json['_id'])
+        doc_json['timestamp'] = document['timestamp'].isoformat()
 
         # 4. EMIT REAL-TIME UPDATE (WebSockets)
+        print(f"📡 Emitting WebSocket update: brightness={document.get('brightness')}, is_night={document.get('is_night')}")
         socketio.emit('update', doc_json) 
         
         return doc_json
 
-    except FileNotFoundError:
-        print("❌ Error: 'processing.exe' not found.")
-        return None
     except Exception as e:
         print(f"❌ Processing Error: {e}")
         return None
 
 # --- MQTT CLIENT (Background Thread) ---
-def on_mqtt_connect(client, userdata, flags, rc):
+def on_mqtt_connect(client, userdata, flags, rc, properties=None):
     print(f"✅ MQTT Connected (rc={rc})")
     client.subscribe(MQTT_TOPIC)
 
@@ -130,11 +187,12 @@ def on_mqtt_message(client, userdata, msg):
         print(f"❌ MQTT Message Error: {e}")
 
 def start_mqtt():
-    mqtt_client = mqtt.Client()
+    mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     mqtt_client.on_connect = on_mqtt_connect
     mqtt_client.on_message = on_mqtt_message
     
     try:
+        print(f"🔌 Connecting to MQTT Broker: {MQTT_BROKER}:{MQTT_PORT} (Topic: {MQTT_TOPIC})")
         mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
         mqtt_client.loop_start() # Run in background thread
         print("🚀 MQTT Listener Started")
@@ -159,13 +217,45 @@ def manual_data():
         return jsonify({"status": "success", "data": result}), 201
     return jsonify({"error": "Processing failed"}), 500
 
+@app.route('/api/latest', methods=['GET'])
+def get_latest():
+    """Get the latest reading - used by frontend Dashboard"""
+    try:
+        latest = collection.find_one({"source": "gcp_vm_mqtt"}, sort=[("timestamp", -1)])
+        if not latest:
+            # Return empty defaults if no data
+            return jsonify({
+                "brightness": 0,
+                "smooth_ldr": 0,
+                "ldr": 0,
+                "motion": 0,
+                "power": 0,
+                "is_night": False,
+                "anomaly": 0
+            })
+        
+        # Convert ObjectId and timestamp for JSON
+        latest['_id'] = str(latest['_id'])
+        if 'timestamp' in latest:
+            latest['timestamp'] = latest['timestamp'].isoformat()
+        
+        return jsonify(latest)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/api/data', methods=['GET'])
 def get_data():
     """Historical Data for Charts"""
     try:
         # Filter to only main source
         cursor = collection.find({"source": "gcp_vm_mqtt"}).sort("timestamp", -1).limit(50)
-        return jsonify([ {**doc, '_id': str(doc['_id'])} for doc in cursor ])
+        results = []
+        for doc in cursor:
+            doc['_id'] = str(doc['_id'])
+            if 'timestamp' in doc:
+                doc['timestamp'] = doc['timestamp'].isoformat()
+            results.append(doc)
+        return jsonify(results)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -188,23 +278,92 @@ def get_status_card():
     return jsonify({
         "mode": mode,
         "last_motion": last_motion_str,
-        "is_night": latest.get('is_night', False), # Now boolean from DB
+        "is_night": latest.get('is_night', False),
         "power": latest.get('power', 0)
     })
     
-# Analytics Endpoints (Energy, Traffic, Modes) - Kept same logic
+# Analytics Endpoints (Energy, Traffic, Modes)
 @app.route('/api/analytics/energy', methods=['GET'])
 def get_energy_analytics():
-    # Efficiency logic...
+    """
+    Energy Savings Calculation using Normalized Formulas:
+    
+    E_baseline = P_full × T_night (where P_full = 1.0)
+    T_night = T_full + T_dim + T_off (total night readings)
+    E_adaptive = T_full + α × T_dim (where α = 0.3 for ECO mode)
+    Energy Saved (%) = ((E_baseline - E_adaptive) / E_baseline) × 100
+    """
+    ALPHA = 0.3  # Dimming factor for ECO mode (30% brightness)
+    
     cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=7)
     logs = list(collection.find({"source": "gcp_vm_mqtt", "timestamp": {"$gte": cutoff}}))
-    if not logs: return jsonify({"efficiency_score": 0, "smart_avg_w": 0, "traditional_w": TRADITIONAL_LIGHT_POWER_W})
     
-    avg_smart = sum(l.get('power',0) for l in logs) / len(logs)
-    saved = TRADITIONAL_LIGHT_POWER_W - avg_smart
-    score = (saved / TRADITIONAL_LIGHT_POWER_W) * 100
+    if not logs:
+        return jsonify({
+            "energy_saved_percent": 0,
+            "t_full": 0,
+            "t_dim": 0,
+            "t_off": 0,
+            "t_night": 0,
+            "e_baseline": 0,
+            "e_adaptive": 0,
+            "formula_breakdown": "No data available"
+        })
     
-    return jsonify({"efficiency_score": round(score, 1), "smart_avg_w": round(avg_smart, 1), "traditional_w": TRADITIONAL_LIGHT_POWER_W})
+    # Count readings in each mode based on brightness
+    t_full = 0  # Brightness = 100% (FULL mode)
+    t_dim = 0   # Brightness = 30% (ECO mode)
+    t_off = 0   # Brightness = 0% (OFF mode, daytime)
+    
+    for log in logs:
+        brightness = log.get('brightness', 0)
+        if brightness == 0:
+            t_off += 1
+        elif brightness < 50:
+            t_dim += 1  # ECO mode (30%)
+        else:
+            t_full += 1  # FULL mode (100%)
+    
+    # Calculate using the formulas
+    # T_night = total night operation time (only when light is ON)
+    t_night = t_full + t_dim
+    
+    if t_night == 0:
+        # All readings are during daytime (OFF), no night operation
+        return jsonify({
+            "energy_saved_percent": 100.0,
+            "t_full": t_full,
+            "t_dim": t_dim,
+            "t_off": t_off,
+            "t_night": t_night,
+            "e_baseline": 0,
+            "e_adaptive": 0,
+            "formula_breakdown": "System is OFF during monitoring period"
+        })
+    
+    # E_baseline = P_full × T_night (with P_full = 1.0)
+    e_baseline = 1.0 * t_night  # = t_night
+    
+    # E_adaptive = (P_full × T_full) + (α × P_full × T_dim)
+    # Simplified: E_adaptive = T_full + α × T_dim
+    e_adaptive = t_full + (ALPHA * t_dim)
+    
+    # Energy Saved (%) = ((E_baseline - E_adaptive) / E_baseline) × 100
+    energy_saved_percent = ((e_baseline - e_adaptive) / e_baseline) * 100
+    
+    # Create formula breakdown string for display
+    formula_breakdown = f"E_baseline = {t_night} | E_adaptive = {t_full} + (0.3 × {t_dim}) = {e_adaptive:.1f}"
+    
+    return jsonify({
+        "energy_saved_percent": round(energy_saved_percent, 1),
+        "t_full": t_full,
+        "t_dim": t_dim,
+        "t_off": t_off,
+        "t_night": t_night,
+        "e_baseline": round(e_baseline, 2),
+        "e_adaptive": round(e_adaptive, 2),
+        "formula_breakdown": formula_breakdown
+    })
 
 @app.route('/api/analytics/traffic', methods=['GET'])
 def get_traffic_analytics():
@@ -230,7 +389,7 @@ def get_mode_analytics():
 
 # --- MAIN ---
 if __name__ == '__main__':
-    print(f"🚀 Unified Backend Starting...")
+    print(f"🚀 Backend Starting (Python Processing - No C++ Required)...")
     start_mqtt()
     # Use socketio.run instead of app.run
     socketio.run(app, host='0.0.0.0', port=5000, debug=True)

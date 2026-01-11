@@ -1,1 +1,26 @@
 node_modules
+
+# Secrets and credentials
+firmware/src/secrets.h
+*.env
+.env
+.env.*
+*.secret
+secrets/
+
+# Python virtual environment
+venv/
+.venv/
+env/
+.env/
+__pycache__/
+*.py[cod]
+
+# IDE
+.vscode/
+.idea/
+
+# Build outputs
+*.o
+*.a
+.pio/

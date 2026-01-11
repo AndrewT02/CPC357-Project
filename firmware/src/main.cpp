@@ -45,7 +45,7 @@ const int PWM_RESOLUTION = 8;
 
 // === TIMING CONSTANTS ===
 const unsigned long LIGHT_TIMER_MS = 30000;   // 30 seconds light duration
-const unsigned long REPORT_INTERVAL_MS = 5000;
+const unsigned long REPORT_INTERVAL_MS = 2000;
 const unsigned long RECONNECT_INTERVAL_MS = 5000; // Try reconnecting every 5s
 const float MAX_LED_POWER_W = 20.0; // Maximum power consumption of LED strip at 100%
 
@@ -164,15 +164,15 @@ void loop() {
   // === 1. LDR READING ===
   // Option A: Simple instant logic (currently active)
   // Digital output: 1=dark (night), 0=bright (day)
-  static int smoothedLdr = 0;
+  // static int smoothedLdr = 0;
   
-  int rawLdr = digitalRead(LDR_PIN);
-  smoothedLdr = rawLdr; // Store for telemetry
-  isNightMode = (rawLdr == 1); // Instant reaction: 1=night, 0=day
+  // int rawLdr = digitalRead(LDR_PIN);
+  // smoothedLdr = rawLdr; // Store for telemetry
+  // isNightMode = (rawLdr == 1); // Instant reaction: 1=night, 0=day
   
-  // --- Option B: HYSTERESIS (Commented - uncomment to use instead of Option A) ---
+  // --- Option B: HYSTERESIS 
   // Prevents flickering at sunrise/sunset by requiring multiple consistent readings
-  /*
+  
   static int smoothedLdr = 0;
   if (now - lastLdrTime > 100) {
       lastLdrTime = now;
@@ -186,15 +186,14 @@ void loop() {
       
       smoothedLdr = ldrSum; // Sum of 10 readings (0-10)
       
-      // Hysteresis thresholds: Night when >7/10 dark, Day when <3/10 dark
-      if (smoothedLdr > (WINDOW_SIZE / 2 + 2)) {
+      // Hysteresis thresholds: Night when >=5/10 dark, Day when <=3/10 dark
+      if (smoothedLdr >= 5) {
           isNightMode = true;
-      } else if (smoothedLdr < (WINDOW_SIZE / 2 - 2)) {
+      } else if (smoothedLdr <= 3) {
           isNightMode = false;
       }
-      // Between 3-7: maintain previous state (no change)
+      // Between 4: maintain previous state (no change)
   }
-  */
 
   // === 2. MOTION LOGIC (Interrupt + Retriggerable Timer) ===
   // Check interrupt flag (set by ISR)
